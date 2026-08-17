@@ -57,6 +57,15 @@ struct ContentView: View {
                 .onHover { if $0 { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
 
                 Spacer().frame(width: 12)
+                
+                Picker("", selection: $engine.selectedOutputDeviceID) {
+                    ForEach(engine.outputDevices) { device in
+                        Text(device.name).tag(device.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 130)
+
 
                 Button("Quit") {
                     NSApplication.shared.terminate(nil)
@@ -117,6 +126,16 @@ struct ContentView: View {
                     VStack(spacing: 12) {
                         ForEach(visibleTargets) { target in
                             TargetRowView(engine: engine, target: target)
+                        }
+                        
+                        if showDebugStatus{
+                            Divider()
+                            Text(engine.statusMessage)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity,alignment: .leading)
+                                .padding(.horizontal)
+                                .padding(.vertical, 6)
                         }
                     }
                     .padding()

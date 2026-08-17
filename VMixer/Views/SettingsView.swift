@@ -40,7 +40,7 @@ struct GeneralSettingsView: View {
 
             Section {
                 Toggle("Launch VMixer at Login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { newValue in
+                    .onChange(of: launchAtLogin) {oldValue, newValue in
                         toggleLaunchAtLogin(enabled: newValue)
                     }
             }
