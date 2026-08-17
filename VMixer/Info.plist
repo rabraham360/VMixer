@@ -4,5 +4,7 @@
 <dict>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>This app needs to capture audio to allow per-app volume mixing.</string>
+	<key>Privacy - Screen Capture Usage Description</key>
+	<string>VMixer needs this to intercept audio signals from other running applications.</string>
 </dict>
 </plist>

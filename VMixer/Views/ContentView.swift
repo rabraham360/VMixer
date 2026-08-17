@@ -12,8 +12,27 @@ struct ContentView: View {
     @Environment(\.openSettings) private var openSettings
     @AppStorage("showDebugStatus") private var showDebugStatus = false
     
+    private var visibleTargets: [AudioEngine.Target]{
+        engine.targets.filter{ !$0.isHidden}
+    }
+    
+    // MARK: - Window Sizing
+    let maxWindowHeight: CGFloat = 600
+    let baseHeight: CGFloat = 135
+    let rowHeight: CGFloat = 100
+    let emptyStateHeight: CGFloat = 150
+    
+    var dynamicHeight: CGFloat {
+        if visibleTargets.isEmpty {
+            return baseHeight + emptyStateHeight
+        }
+        let contentHeight = baseHeight + (CGFloat(visibleTargets.count) * rowHeight) + 24
+        return min(contentHeight, maxWindowHeight)
+    }
+    
     var body: some View {
         VStack(spacing: 0) {
+            
             // MARK: - Header
             HStack {
                 Text("VMixer")
@@ -35,6 +54,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .focusable(false)
+                .onHover { if $0 { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
 
                 Spacer().frame(width: 12)
                 
@@ -51,15 +71,17 @@ struct ContentView: View {
                     NSApplication.shared.terminate(nil)
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(.secondary)
                 .focusable(false)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .onHover { if $0 { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
             }
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
             
             Divider()
 
-            // MARK: - Master Volume (Controls System Output)
+            // MARK: - Master Volume Controls
             VStack(spacing: 12) {
                 HStack(spacing: 12) {
                     Button(action: {
@@ -87,7 +109,7 @@ struct ContentView: View {
             Divider()
 
             // MARK: - Active Apps List
-            if engine.targets.isEmpty {
+            if visibleTargets.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: "speaker.zzz")
@@ -102,7 +124,7 @@ struct ContentView: View {
             } else {
                 ScrollView {
                     VStack(spacing: 12) {
-                        ForEach(engine.targets) { target in
+                        ForEach(visibleTargets) { target in
                             TargetRowView(engine: engine, target: target)
                         }
                         
@@ -120,7 +142,23 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            
+            // MARK: - Status Bar
+            if showDebugStatus {
+                Divider()
+                HStack {
+                    Text(engine.statusMessage)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                .background(Color(NSColor.windowBackgroundColor))
+            }
         }
-        .frame(width: 340, height: 600)
+        .frame(width: 340, height: dynamicHeight)
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: visibleTargets.count)
     }
 }

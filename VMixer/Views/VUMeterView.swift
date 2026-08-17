@@ -8,43 +8,36 @@
 import SwiftUI
 
 struct VUMeterView: View {
-    var level: Float 
-    
-    // Customization: Tweak these to change the look
-    let segmentCount = 20
-    let spacing: CGFloat = 1.0
+    var level: Float
 
     var body: some View {
         GeometryReader { geo in
-            // Calculate how tall each little LED block should be
-            let totalSpacing = CGFloat(segmentCount - 1) * spacing
-            let segmentHeight = max(0, (geo.size.height - totalSpacing) / CGFloat(segmentCount))
-            
-            VStack(spacing: spacing) {
-                // Reverse the loop so index 0 (lowest volume) is at the bottom of the VStack
-                ForEach((0..<segmentCount).reversed(), id: \.self) { index in
-                    let segmentThreshold = Float(index + 1) / Float(segmentCount)
-                    let isLit = level >= segmentThreshold
-                    let segmentColor = colorFor(index: index)
-                    
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(segmentColor)
-                        .opacity(isLit ? 1.0 : 0.15)
-                        .frame(height: segmentHeight)
-                        .shadow(color: isLit ? segmentColor.opacity(0.6) : .clear, radius: 1, x: 0, y: 0)
-                }
+            ZStack(alignment: .bottom) {
+                // Background Track (Empty)
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color(NSColor.tertiaryLabelColor).opacity(0.2))
+                
+                // Lit Audio Track (Solid Gradient)
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(
+                        LinearGradient(
+                            gradient: Gradient(colors: [.green, .yellow, .red]),
+                            startPoint: .bottom,
+                            endPoint: .top
+                        )
+                    )
+                    // This mask slides up and down based on the audio level
+                    .mask(
+                        VStack(spacing: 0) {
+                            Spacer(minLength: 0)
+                            Rectangle()
+                                .frame(height: geo.size.height * CGFloat(max(0, min(level, 1.0))))
+                        }
+                    )
             }
-            .animation(.easeOut(duration: 0.05), value: level)
+            .animation(.easeOut(duration: 0.1), value: level)
         }
-        // Force the width to be a tiny, sleek bar
-        .frame(width: 5)
-    }
-    
-    // Bottom is green, middle is yellow, top is red
-    private func colorFor(index: Int) -> Color {
-        let ratio = Float(index) / Float(segmentCount)
-        if ratio < 0.65 { return .green }
-        if ratio < 0.85 { return .yellow }
-        return .red
+        // Forces the bar to be sleek and tiny
+        .frame(width: 6)
     }
 }
