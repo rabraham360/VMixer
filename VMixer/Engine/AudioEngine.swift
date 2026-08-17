@@ -11,7 +11,6 @@ import CoreAudio
 import AudioToolbox
 import Combine
 import Accelerate
-import CoreGraphics
 import AVFoundation
 import os
 
@@ -116,10 +115,8 @@ final class AudioEngine: ObservableObject {
             
             if masterVolume <= 0.001 && !isMasterMuted {
                 isMasterMuted = true
-                syncSystemMute(muted: true)
             } else if masterVolume > 0.001 && isMasterMuted {
                 isMasterMuted = false
-                syncSystemMute(muted: false)
             }
             isSyncingInternally = false
         }
@@ -163,7 +160,11 @@ final class AudioEngine: ObservableObject {
     }
 
     init() {
-        // 1. Immediately delete any crashed/ghost aggregate devices before starting!
+        UserDefaults.standard.register(defaults: [
+            "autoHookEnabled": true,
+            "ignoredBundleIDs": "com.apple.finder"
+        ])
+        
         cleanupOrphanedDevices()
         
         refreshRunningApps()
@@ -173,7 +174,6 @@ final class AudioEngine: ObservableObject {
         self.isMasterMuted = getCurrentSystemMute()
         self.isSyncingInternally = false
         
-        if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
         let audioStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         if audioStatus == .notDetermined { AVCaptureDevice.requestAccess(for: .audio) { _ in } }
         
@@ -183,9 +183,14 @@ final class AudioEngine: ObservableObject {
         autoHookExistingMediaApps()
         setupAutoHookingObserver()
         
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            self?.updateMeters()
+        let timer = Timer(timeInterval: 1.0/30, repeats: true) { [weak self] _ in
+            Task{@MainActor[weak self] in
+                self?.updateMeters()
+            }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+        
     }
     
     private func updateMeters() {
@@ -197,13 +202,24 @@ final class AudioEngine: ObservableObject {
     
     // MARK: - Orphan Cleanup
     private func cleanupOrphanedDevices() {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
         var dataSize: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize) == noErr else { return }
         
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize) == noErr else { return }
         let deviceCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        
         var deviceIDs = [AudioObjectID](repeating: 0, count: deviceCount)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize, &deviceIDs) == noErr else { return }
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &propertyAddress,
+            0,
+            nil,
+            &dataSize,
+            &deviceIDs) == noErr
+        else { return }
         
         for deviceID in deviceIDs {
             if let name = getDeviceName(deviceID: deviceID), name.hasPrefix("VMixer-") {
@@ -215,14 +231,23 @@ final class AudioEngine: ObservableObject {
 
     // MARK: - Auto Hooking Logic
     private func autoHookExistingMediaApps() {
-        let mediaAppBundles: Set<String> = [
-            "com.spotify.client", "com.apple.Music", "com.apple.Safari",
-            "com.google.Chrome", "org.mozilla.firefox", "com.apple.FaceTime"
-        ]
+        guard UserDefaults.standard.bool(forKey: "autoHookEnabled") else { return }
+        
+        let ignoredString = UserDefaults.standard.string(forKey: "ignoredBundleIDs") ?? "com.apple.finder"
+        let ignoredBundleIDs = Set(ignoredString.split(separator: ",").map(String.init))
         
         for app in NSWorkspace.shared.runningApplications {
-            guard let bundleID = app.bundleIdentifier, mediaAppBundles.contains(bundleID), app.processIdentifier > 0 else { continue }
-            let runningApp = RunningApp(pid: app.processIdentifier, name: app.localizedName ?? bundleID, bundleID: bundleID)
+            guard app.activationPolicy == .regular,
+                  app.processIdentifier > 100,
+                  let bundleID = app.bundleIdentifier,
+                  !ignoredBundleIDs.contains(bundleID),
+                  app.processIdentifier > 0 else { continue }
+
+            let runningApp = RunningApp(
+                pid: app.processIdentifier,
+                name: app.localizedName ?? bundleID,
+                bundleID: bundleID
+            )
             addTarget(app: runningApp)
         }
     }
@@ -248,6 +273,14 @@ final class AudioEngine: ObservableObject {
                 self.addTarget(app: runningApp)
             }
             .store(in: &cancellables)
+        
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+                self?.removeTarget(pid: app.processIdentifier)
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - App Tracking & Setup
@@ -265,40 +298,66 @@ final class AudioEngine: ObservableObject {
     }
 
     func addTarget(pid: Int32, name: String?) {
-        addTarget(pid: pid, name: name, bundleID: nil)
+        let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        addTarget(pid: pid, name: name, bundleID: bundleID)
     }
 
-    private func addTarget(pid: Int32, name: String?, bundleID: String?) {
-        guard pid > 0, !targets.contains(where: { $0.pid == pid }) else { return }
+    @discardableResult
+    private func addTarget(pid: Int32, name: String?, bundleID: String?) -> Bool {
+        guard pid > 0, !targets.contains(where: { $0.pid == pid }) else { return false }
 
-        guard let tapResult = createTapWithFallback(pid: pid, bundleID: bundleID) else { return }
+        guard let tapResult = createTapWithFallback(pid: pid, bundleID: bundleID) else { return false }
         let tapID = tapResult.tapID
-        guard tapID != kAudioObjectUnknown, tapID != 0 else { return }
+        guard tapID != kAudioObjectUnknown, tapID != 0 else { return false }
 
-        // NEW: Apply the Software Pre-Amp if the tap was forced into a quiet Mixdown
         let control = RealtimeControl(volumeCompensation: tapResult.volumeCompensation)
         
         guard let aggregateDeviceID = createAggregateDevice(tapID: tapID) else {
             _ = AudioHardwareDestroyProcessTap(tapID)
-            return
+            return false
         }
         guard let ioProcID = startTapIO(deviceID: aggregateDeviceID, control: control) else {
             _ = AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
             _ = AudioHardwareDestroyProcessTap(tapID)
-            return
+            return false
         }
 
         controlsByPID[pid] = control
         let displayName = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "PID \(pid)" : name!
         let appIcon = NSRunningApplication(processIdentifier: pid)?.icon
 
-        let target = Target(id: pid, pid: pid, displayName: displayName, tapID: tapID, aggregateDeviceID: aggregateDeviceID, ioProcID: ioProcID, volume: 1.0, isMuted: false, icon: appIcon)
+        let target = Target(
+            id: pid,
+            pid: pid,
+            displayName: displayName,
+            tapID: tapID,
+            aggregateDeviceID: aggregateDeviceID,
+            ioProcID: ioProcID,
+            volume: 1.0,
+            isMuted: false,
+            icon: appIcon
+        )
         targets.append(target)
         statusMessage = "Auto-Hooked \(target.displayName)"
+        return true
     }
 
     func addTarget(app: RunningApp) {
-        addTarget(pid: app.pid, name: app.name, bundleID: app.bundleID)
+        guard !targets.contains(where: { $0.pid == app.pid }) else { return }
+        
+        if !addTarget(pid: app.pid, name: app.name, bundleID: app.bundleID) {
+            print("Initial tap creation failed for \(app.name). Queueing retry...")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.retryTapCreation(for: app)
+            }
+        }
+    }
+
+    private func retryTapCreation(for app: RunningApp) {
+        guard !targets.contains(where: { $0.pid == app.pid }) else { return }
+        if addTarget(pid: app.pid, name: app.name, bundleID: app.bundleID) {
+            print("Successfully hooked \(app.name) on retry.")
+        }
     }
 
     // MARK: - CoreAudio Integration
@@ -312,6 +371,12 @@ final class AudioEngine: ObservableObject {
             var bundlesToTap = [bundleID]
             var compensation: Float = 1.0
             switch bundleID {
+            case "com.spotify.client":
+                bundlesToTap.append("com.spotify.client.helper")
+                compensation = 1.0
+            case "com.apple.Music":
+                bundlesToTap.append("com.apple.audio.sandbox")
+                compensation = 1.0
             case "com.apple.Safari", "com.apple.SafariTechnologyPreview":
                 bundlesToTap.append("com.apple.WebKit.WebContent")
                 bundlesToTap.append("com.apple.WebKit.GPU")
@@ -345,13 +410,16 @@ final class AudioEngine: ObservableObject {
             bundleDescription.isPrivate = false
             bundleDescription.muteBehavior = .mutedWhenTapped
 
-            if AudioHardwareCreateProcessTap(bundleDescription, &bundleTapID) == noErr {
+            let status = AudioHardwareCreateProcessTap(bundleDescription, &bundleTapID)
+            if status == noErr {
                 let recoveredTapID = normalizedTapID(bundleTapID, fallbackUID: bundleDescription.uuid.uuidString, expectedName: bundleDescription.name)
                 if recoveredTapID != kAudioObjectUnknown, recoveredTapID != 0 {
-                    return (recoveredTapID, needsMixdown ? compensation:1.0)
+                    return (recoveredTapID, needsMixdown ? compensation : 1.0)
                 }
-                statusMessage = "Tap was created but UID lookup failed."
+                statusMessage = "Tap created but UID lookup failed for \(bundleID)"
                 return nil
+            } else {
+                print("AudioHardwareCreateProcessTap failed for \(bundleID) with OSStatus: \(status)")
             }
         }
 
@@ -363,15 +431,16 @@ final class AudioEngine: ObservableObject {
             pidDescription.isPrivate = false
             pidDescription.muteBehavior = .mutedWhenTapped
 
-            if AudioHardwareCreateProcessTap(pidDescription, &pidTapID) == noErr {
+            let status = AudioHardwareCreateProcessTap(pidDescription, &pidTapID)
+            if status == noErr {
                 let recoveredTapID = normalizedTapID(pidTapID, fallbackUID: pidDescription.uuid.uuidString, expectedName: pidDescription.name)
                 if recoveredTapID != kAudioObjectUnknown, recoveredTapID != 0 {
-                    // Tap by PID forces a stereoMixdown, so it requires the volume boost
                     return (recoveredTapID, 2.0)
                 }
                 return nil
+            } else {
+                print("AudioHardwareCreateProcessTap by PID failed for \(pid) with OSStatus: \(status)")
             }
-            return nil
         }
 
         statusMessage = "PID \(pid) cannot be tapped."
@@ -387,10 +456,17 @@ final class AudioEngine: ObservableObject {
 
     private func translateTapUIDToObjectID(uid: String) -> AudioObjectID? {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslateUIDToTap, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var uidValue: CFString = uid as CFString
+        var uidCF = uid as CFString
         var tapID: AudioObjectID = 0
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
-        let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, UInt32(MemoryLayout<CFString>.size), &uidValue, &size, &tapID)
+        let status = withUnsafePointer(to: &uidCF){ uidPtr in AudioObjectGetPropertyData(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                UInt32(MemoryLayout<CFString>.size),
+                uidPtr,
+                &size,
+                &tapID)
+        }
         guard status == noErr, tapID != 0, tapID != kAudioObjectUnknown else { return nil }
         return tapID
     }
@@ -412,11 +488,18 @@ final class AudioEngine: ObservableObject {
     }
 
     private func objectName(for objectID: AudioObjectID) -> String? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
         var cfName: CFString?
         var size = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &cfName) == noErr, let name = cfName else { return nil }
-        return name as String
+        
+        let status = withUnsafeMutablePointer(to: &cfName) { ptr in
+            AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, ptr)
+        }
+        guard status == noErr, let name = cfName as String? else { return nil }
+        return name
     }
 
     // MARK: - App Controls
@@ -430,8 +513,9 @@ final class AudioEngine: ObservableObject {
         }
         _ = AudioHardwareDestroyAggregateDevice(target.aggregateDeviceID)
         _ = AudioHardwareDestroyProcessTap(target.tapID)
-        controlsByPID[pid] = nil
+        controlsByPID.removeValue(forKey: pid)
         targets.remove(at: index)
+        statusMessage = "Removed \(target.displayName)"
     }
 
     func setMuted(pid: Int32, muted: Bool) {
@@ -519,11 +603,19 @@ final class AudioEngine: ObservableObject {
     }
 
     private func tapUID(for tapID: AudioObjectID) -> String? {
-        var address = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
         var cfUID: CFString?
         var size = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &cfUID) == noErr, let uid = cfUID else { return nil }
-        return uid as String
+        
+        let status = withUnsafeMutablePointer(to: &cfUID) { ptr in
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, ptr)
+        }
+        
+        guard status == noErr, let uid = cfUID as String? else { return nil }
+        return uid
     }
 
     private func defaultOutputDeviceUID() -> String? {
@@ -531,13 +623,22 @@ final class AudioEngine: ObservableObject {
         var deviceID: AudioObjectID = 0
         var size = UInt32(MemoryLayout<AudioObjectID>.size)
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr, deviceID != kAudioObjectUnknown else { return nil }
-
-        var uidAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        
+        var uidAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
         var cfUID: CFString?
         var uidSize = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, &cfUID) == noErr, let uid = cfUID else { return nil }
-        return uid as String
+        
+        let status = withUnsafeMutablePointer(to: &cfUID) { ptr in
+            AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, ptr)
+        }
+        
+        guard status == noErr, let uid = cfUID as String? else { return nil }
+        return uid
     }
+
 
     private func translatePIDToProcessObjectID(pid: Int32) -> AudioObjectID? {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
@@ -565,17 +666,18 @@ final class AudioEngine: ObservableObject {
             }
         }
         
-        DispatchQueue.main.async {
-            self.outputDevices = newDevices
-            self.selectedOutputDeviceID = self.getDefaultOutputDevice()
-        }
+        outputDevices = newDevices
+        selectedOutputDeviceID = getDefaultOutputDevice()
     }
     
     private func hasOutputChannels(deviceID: AudioObjectID) -> Bool {
         var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
         var dataSize: UInt32 = 0
         guard AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, nil, &dataSize) == noErr else { return false }
-        let bufferList = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: Int(dataSize))
+        let bufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(dataSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        ).assumingMemoryBound(to: AudioBufferList.self)
         defer { bufferList.deallocate() }
         guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, bufferList) == noErr else { return false }
         for buffer in UnsafeMutableAudioBufferListPointer(bufferList) {
@@ -585,10 +687,18 @@ final class AudioEngine: ObservableObject {
     }
     
     private func getDeviceName(deviceID: AudioObjectID) -> String? {
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
         var name: CFString?
         var dataSize = UInt32(MemoryLayout<CFString?>.size)
-        guard AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, &name) == noErr, let deviceName = name as String? else { return nil }
+        
+        let status = withUnsafeMutablePointer(to: &name) { ptr in
+            AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nil, &dataSize, ptr)
+        }
+        
+        guard status == noErr, let deviceName = name as String? else { return nil }
         return deviceName
     }
     
